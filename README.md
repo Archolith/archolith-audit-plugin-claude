@@ -7,35 +7,50 @@ Live MCP token usage audit for Claude Code sessions. Tracks per-server token spe
 ### From GitHub (recommended)
 
 ```
-/install-plugin github:archolith/archolith-audit-plugin-claude
+/plugin install github:Archolith/archolith-audit-plugin-claude
 ```
 
 Claude Code clones the plugin, registers the MCP server, and activates the hooks.
 No `pip install` needed — the Python package is bundled inside the plugin directory.
 
-### Manual install
+### Manual install (no plugin system)
 
-1. Clone or download the plugin directory.
-2. Run `/install-plugin /path/to/archolith-mcp-audit/plugins/claude`.
-3. Restart Claude Code.
+Clone the repo and run the installer:
+
+```bash
+git clone https://github.com/Archolith/archolith-audit-plugin-claude
+cd archolith-audit-plugin-claude
+python install.py
+```
+
+Restart Claude Code after running.
+
+### Local testing (development)
+
+Test a local copy without installing:
+
+```bash
+claude --plugin-dir /path/to/archolith-audit-plugin-claude
+```
 
 ### Verify
 
 After install, start a session and do some work. Then:
 
 ```
-/audit
+/archolith-audit:audit
 ```
 
-Should show per-server token usage. If it shows "No tool results observed yet," the
-hook is not firing — check that `MCP_AUDIT_ENABLED=1` is set in the MCP server env
-and that Python can import `archolith_mcp_audit` via the `PYTHONPATH` set in
-`plugin.json`.
+Or ask Claude directly: _"show me the MCP audit summary"_
+
+If it shows "No tool results observed yet," the hook is not firing — check that
+`MCP_AUDIT_ENABLED=1` is set in the MCP server env and that Python can find
+`archolith_mcp_audit` via the `PYTHONPATH` set in `plugin.json`.
 
 ### Uninstall
 
 ```
-/uninstall-plugin archolith-audit
+/plugin uninstall archolith-audit
 ```
 
 ## Structure
@@ -44,7 +59,8 @@ and that Python can import `archolith_mcp_audit` via the `PYTHONPATH` set in
 .claude-plugin/plugin.json    ← metadata + MCP server registration
 hooks/hooks.json              ← async PostToolUse hook (.* matcher)
 hook_observer.py              ← standalone hook wrapper (writes JSONL observations)
-skills/audit/SKILL.md         ← /audit slash command
+skills/audit/SKILL.md         ← /archolith-audit:audit slash command
+install.py                    ← manual installer (no plugin system required)
 archolith_mcp_audit/          ← bundled core Python package (no pip install needed)
 ```
 
