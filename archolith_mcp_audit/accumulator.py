@@ -1,6 +1,6 @@
 """Live per-session token accumulator.
 
-Reads from RTK's FilterTelemetryStore (when available) or from
+Reads from archolith-filter's FilterTelemetryStore (when available) or from
 direct tool result observation. Provides aggregated per-server
 token usage data for the in-session MCP audit tools.
 """
@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 
 from archolith_mcp_audit.attributor import attribute_tool
 from archolith_mcp_audit.waste_detector import WasteFinding
+
+__all__ = [
+    "ServerAccumulator",
+    "LiveAccumulator",
+]
 
 
 @dataclass
@@ -54,7 +59,7 @@ class LiveAccumulator:
         self.total_results += 1
 
     def observe_telemetry_entry(self, entry: object) -> None:
-        """Observe from an RTK FilterTelemetryStore entry.
+        """Observe from an archolith-filter FilterTelemetryStore entry.
 
         Expected entry attributes: tool_name, raw_chars, filtered_chars.
         Falls back gracefully if attributes don't exist.

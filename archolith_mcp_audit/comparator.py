@@ -8,6 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+__all__ = [
+    "ServerDelta",
+    "compare_reports",
+    "format_delta_report",
+]
+
 
 @dataclass
 class ServerDelta:
@@ -24,8 +30,8 @@ class ServerDelta:
     waste_change_pct: float = 0.0
     before_calls: int = 0
     after_calls: int = 0
-    new_waste_types: list[str] = None  # type: ignore[assignment]
-    resolved_waste_types: list[str] = None  # type: ignore[assignment]
+    new_waste_types: list[str] | None = None
+    resolved_waste_types: list[str] | None = None
     status: str = ""  # "improved", "regressed", "no_change", "new", "removed"
 
 

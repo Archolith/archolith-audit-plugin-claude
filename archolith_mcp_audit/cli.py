@@ -1,4 +1,4 @@
-"""CLI entry point for archolith-mcp-audit."""
+"""CLI entry point for archolith-audit."""
 
 from __future__ import annotations
 
@@ -7,6 +7,10 @@ import json
 import os
 import sys
 from pathlib import Path
+
+__all__ = [
+    "main",
+]
 
 from archolith_mcp_audit.attributor import _load_mapping
 from archolith_mcp_audit.report import (

@@ -1,13 +1,14 @@
 """In-session MCP audit server.
 
-Exposes three tools:
+Exposes four tools:
   mcp_audit_summary — lightweight per-server token share table
   mcp_audit_detail  — deep dive on one server
   mcp_audit_check   — threshold pass/fail check
+  mcp_audit_bridge_status — telemetry bridge status
 
 The server maintains a LiveAccumulator that observes tool results
 as the session progresses. Observations are fed via a TelemetryBridge
-that connects to RTK telemetry, file-based telemetry, or direct push
+that connects to archolith-filter telemetry, file-based telemetry, or direct push
 from hook observers.
 
 Disabled by default to avoid adding ~200-300 tokens of schema overhead
@@ -28,6 +29,7 @@ except ImportError:
 
 import time
 
+from archolith_mcp_audit._paths import safe_session_path
 from archolith_mcp_audit.accumulator import LiveAccumulator
 from archolith_mcp_audit.attributor import _load_mapping
 from archolith_mcp_audit.telemetry_bridge import TelemetryBridge
@@ -37,31 +39,61 @@ _mcp_server: FastMCP | None = None
 
 SESSIONS_DIR = Path.home() / ".archolith" / "sessions"
 MAX_SESSION_AGE_HOURS = 24
+ACTIVE_SESSION_CACHE_TTL_SECONDS = 30.0
 
 # Per-session caches (keyed by session_id)
 _accumulators: dict[str, LiveAccumulator] = {}
 _bridges: dict[str, TelemetryBridge] = {}
+_active_sessions_cache: tuple[float, list[str]] | None = None
+
+__all__ = [
+    "mcp_audit_summary",
+    "mcp_audit_detail",
+    "mcp_audit_check",
+    "mcp_audit_bridge_status",
+    "_reset_caches",
+    "get_accumulator",
+    "get_bridge",
+    "list_active_sessions",
+]
+
+
+def _reset_caches() -> None:
+    """Clear all per-session caches. Used in testing."""
+    global _active_sessions_cache, _accumulators, _bridges
+    _accumulators.clear()
+    _bridges.clear()
+    _active_sessions_cache = None
 
 
 def list_active_sessions() -> list[str]:
     """Return session IDs with JSONL files modified in the last 24h, newest first."""
+    global _active_sessions_cache
+
+    now = time.time()
+    if _active_sessions_cache is not None:
+        cached_at, cached_sessions = _active_sessions_cache
+        if now - cached_at < ACTIVE_SESSION_CACHE_TTL_SECONDS:
+            return list(cached_sessions)
+
     if not SESSIONS_DIR.exists():
+        _active_sessions_cache = (now, [])
         return []
-    cutoff = time.time() - MAX_SESSION_AGE_HOURS * 3600
-    sessions = [
-        p.stem for p in SESSIONS_DIR.glob("*.jsonl")
-        if p.stat().st_mtime > cutoff
-    ]
-    return sorted(
-        sessions,
-        key=lambda s: (SESSIONS_DIR / f"{s}.jsonl").stat().st_mtime,
+
+    cutoff = now - MAX_SESSION_AGE_HOURS * 3600
+    session_paths = [p for p in SESSIONS_DIR.glob("*.jsonl") if p.stat().st_mtime > cutoff]
+    sessions = sorted(
+        (p.stem for p in session_paths),
+        key=lambda s: safe_session_path(SESSIONS_DIR, s).stat().st_mtime,
         reverse=True,
     )
+    _active_sessions_cache = (now, sessions)
+    return list(sessions)
 
 
 def get_session_name(session_id: str) -> str:
     """Return the human-readable name written by hook_session_start, or short ID."""
-    name_file = SESSIONS_DIR / f"{session_id}.name"
+    name_file = safe_session_path(SESSIONS_DIR, session_id, suffix=".name")
     if name_file.exists():
         return name_file.read_text(encoding="utf-8").strip()
     return session_id[:16]
@@ -81,18 +113,22 @@ def get_bridge(session_id: str) -> TelemetryBridge:
     Connects to ~/.archolith/sessions/<session_id>.jsonl written by the
     hook_observer_standalone PostToolUse hook.
     Also honours:
-      - MCP_AUDIT_RTK=1          — connect to RTK FilterTelemetryStore
+      - MCP_AUDIT_FILTER=1       — connect to archolith-filter telemetry (preferred)
+      - MCP_AUDIT_RTK=1          — connect to archolith-filter telemetry (legacy alias)
       - MCP_AUDIT_TELEMETRY_FILE — override file path (single-session compat)
     """
     if session_id not in _bridges:
         bridge = TelemetryBridge(accumulator=get_accumulator(session_id))
 
-        if os.environ.get("MCP_AUDIT_RTK", "").lower() in ("1", "true", "yes"):
+        # MCP_AUDIT_FILTER is preferred, MCP_AUDIT_RTK is legacy alias
+        filter_enabled = os.environ.get("MCP_AUDIT_FILTER", "").lower() in ("1", "true", "yes")
+        rtk_enabled = os.environ.get("MCP_AUDIT_RTK", "").lower() in ("1", "true", "yes")
+        if filter_enabled or rtk_enabled:
             bridge.connect_rtk()
 
         # Explicit override takes precedence (backward compat)
         override = os.environ.get("MCP_AUDIT_TELEMETRY_FILE", "")
-        path = Path(override) if override else SESSIONS_DIR / f"{session_id}.jsonl"
+        path = Path(override) if override else safe_session_path(SESSIONS_DIR, session_id)
         bridge.connect_file(path)
         _bridges[session_id] = bridge
 
@@ -214,11 +250,13 @@ if _HAS_FASTMCP:
                 found_any = True
                 data = summary[server]
                 lines.append(
-                    f"  [{name}]  {data['call_count']} calls, "
-                    f"{data['raw_chars']:,} chars ({data['share_pct']:.1f}%)"
+                    f"  [{name}]  {data.get('call_count', 0)} calls, "
+                    f"{data.get('raw_chars', 0):,} chars ({data.get('share_pct', 0.0):.1f}%)"
                 )
-                lines.append(f"    Tools: {', '.join(data['tools'][:6])}")
-                lines.append(f"    Compression savings: {data['savings_pct']:.1f}%")
+                tools = data.get("tools", [])
+                lines.append(f"    Tools: {', '.join(tools[:6]) if tools else '(unknown)'}")
+                savings_pct = data.get("savings_pct", 0.0)
+                lines.append(f"    Compression savings: {savings_pct:.1f}%")
 
                 findings = data.get("waste_findings", [])
                 if findings:
@@ -227,9 +265,9 @@ if _HAS_FASTMCP:
                         lines.append(f"      [{f.severity.upper()}] {f.waste_type}: {f.suggestion}")
                     if len(findings) > 3:
                         lines.append(f"      ... and {len(findings) - 3} more")
-                elif data["savings_pct"] > 80:
+                elif savings_pct > 80:
                     lines.append("    Suggestion: Very verbose output — consider compact mode.")
-                elif data["savings_pct"] > 50:
+                elif savings_pct > 50:
                     lines.append("    Suggestion: Moderate verbosity — envelope stripping may help.")
                 lines.append("")
 

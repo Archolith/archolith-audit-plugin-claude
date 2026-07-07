@@ -18,9 +18,21 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from archolith_mcp_audit.detectors.schema_cost import AVG_SCHEMA_TOKENS
 from archolith_mcp_audit.tokenizer import estimate_tokens
 
 log = logging.getLogger(__name__)
+
+__all__ = [
+    "SchemaEntry",
+    "ServerSchemaCost",
+    "SchemaRefreshResult",
+    "refresh_schema_catalog",
+    "load_catalog",
+    "estimate_server_schema_cost",
+    "compute_all_schema_costs",
+    "count_schema_tokens",
+]
 
 _DEFAULT_CATALOG_PATH = Path(__file__).parent / "data" / "schema_catalog.json"
 _STALE_DAYS = 30
@@ -28,6 +40,7 @@ _PER_SERVER_TIMEOUT = 15.0  # seconds per server for list_tools query
 
 # Commands that indicate a Python process (for self-exclusion check)
 _PYTHON_COMMANDS = frozenset({"python", "python3", "python.exe"})
+_SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "PASS", "CREDENTIAL")
 
 
 @dataclass
@@ -54,7 +67,7 @@ class ServerSchemaCost:
 
 
 def _is_self_server(name: str, command: str, args: list[str]) -> bool:
-    """Check whether an MCP server entry refers to archolith-mcp-audit itself.
+    """Check whether an MCP server entry refers to archolith-audit itself.
 
     Two checks:
       1. Server name matches ``archolith-audit``.
@@ -68,7 +81,7 @@ def _is_self_server(name: str, command: str, args: list[str]) -> bool:
         return True
 
     cmd_lower = command.strip().lower()
-    if cmd_lower in _PYTHON_COMMANDS or cmd_lower.endswith(".exe") and "python" in cmd_lower:
+    if cmd_lower in _PYTHON_COMMANDS or (cmd_lower.endswith(".exe") and "python" in cmd_lower):
         for arg in args:
             if "archolith_mcp_audit" in arg:
                 log.debug("Skipping self by command pattern: %s %s", command, args)
@@ -109,6 +122,24 @@ def _is_queryable_server(name: str, server_conf: dict) -> bool:
     if _is_self_server(name, command, args):
         return False
     return bool(command)
+
+
+def _warn_secret_like_env(server_name: str, env: dict | None) -> None:
+    """Warn when trusted .mcp.json env keys look credential-like."""
+    if not env:
+        return
+
+    flagged = sorted(
+        key for key in env
+        if any(marker in str(key).upper() for marker in _SECRET_ENV_MARKERS)
+    )
+    if flagged:
+        log.warning(
+            "%s .mcp.json env contains secret-like keys passed to the MCP subprocess: %s. "
+            "Review the trusted config; archolith-audit does not filter configured env.",
+            server_name,
+            ", ".join(flagged),
+        )
 
 
 async def _query_server_via_fastmcp(
@@ -159,22 +190,21 @@ async def _refresh_all_servers(
     servers_config: dict,
     failed_servers: dict[str, str],
 ) -> dict[str, list[dict]]:
-    """Query all configured servers sequentially, returning the catalog dict.
+    """Query all configured servers concurrently, returning the catalog dict.
 
     Each server that fails is recorded in ``failed_servers`` with an error
     message. The catalog will contain only successfully queried servers.
     """
     catalog: dict[str, list[dict]] = {}
+    eligible: list[tuple[str, dict]] = []
 
     for server_name, server_conf in servers_config.items():
         command = server_conf.get("command", "")
         args = server_conf.get("args", [])
-        cwd = server_conf.get("cwd")
-        env = server_conf.get("env")
 
         # Skip self
         if _is_self_server(server_name, command, args):
-            log.info("Skipping archolith-mcp-audit itself (%s)", server_name)
+            log.info("Skipping archolith-audit itself (%s)", server_name)
             continue
 
         # Only stdio transport is supported (command field present)
@@ -182,8 +212,16 @@ async def _refresh_all_servers(
             log.warning("Skipping %s — no command field (SSE/HTTP transport?)", server_name)
             continue
 
-        log.info("Querying %s for tool schemas...", server_name)
+        eligible.append((server_name, server_conf))
 
+    async def _refresh_one(server_name: str, server_conf: dict) -> tuple[str, list[dict] | None]:
+        command = server_conf.get("command", "")
+        args = server_conf.get("args", [])
+        cwd = server_conf.get("cwd")
+        env = server_conf.get("env")
+
+        log.info("Querying %s for tool schemas...", server_name)
+        _warn_secret_like_env(server_name, env)
         try:
             tool_defs = await _query_server_via_fastmcp(
                 server_name=server_name,
@@ -195,15 +233,15 @@ async def _refresh_all_servers(
         except TimeoutError:
             failed_servers[server_name] = f"timed out after {_PER_SERVER_TIMEOUT}s"
             log.warning("Timed out querying %s", server_name)
-            continue
+            return server_name, None
         except FileNotFoundError:
             failed_servers[server_name] = f"command not found: {command}"
             log.warning("Command not found for %s: %s", server_name, command)
-            continue
+            return server_name, None
         except Exception as exc:
             failed_servers[server_name] = str(exc)
             log.warning("Failed to query %s: %s", server_name, exc)
-            continue
+            return server_name, None
 
         # Build catalog entry for this server
         entries: list[dict] = []
@@ -215,12 +253,17 @@ async def _refresh_all_servers(
             })
 
         if entries:
-            catalog[server_name] = entries
             log.info("  -> %s: %d tools, %d total schema tokens",
                       server_name, len(entries), sum(e["schema_tokens"] for e in entries))
         else:
-            catalog[server_name] = []
             log.info("  -> %s: 0 tools (empty list)", server_name)
+        return server_name, entries
+
+    for server_name, entries in await asyncio.gather(
+        *(_refresh_one(server_name, server_conf) for server_name, server_conf in eligible)
+    ):
+        if entries is not None:
+            catalog[server_name] = entries
 
     return catalog
 
@@ -371,6 +414,13 @@ def load_catalog(path: Path | None = None) -> dict[str, list[SchemaEntry]]:
                 entries.append(SchemaEntry(tool_name=tool[0], schema_tokens=tool[1]))
         result[server] = entries
 
+    if not result:
+        log.warning(
+            "Schema catalog is empty; schema_cost detector will use AVG_SCHEMA_TOKENS=%d defaults. "
+            "Run --refresh-schemas for accurate schema costs.",
+            AVG_SCHEMA_TOKENS,
+        )
+
     return result
 
 
@@ -378,7 +428,7 @@ def estimate_server_schema_cost(
     server: str,
     tool_names: list[str],
     total_turns: int = 1,
-    avg_schema_tokens: int = 300,
+    avg_schema_tokens: int = AVG_SCHEMA_TOKENS,
 ) -> ServerSchemaCost:
     """Estimate schema cost for a server when no catalog is available.
 

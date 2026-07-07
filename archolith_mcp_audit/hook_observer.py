@@ -38,6 +38,15 @@ from archolith_mcp_audit.telemetry_bridge import (
 
 log = logging.getLogger(__name__)
 
+__all__ = [
+    "HookEvent",
+    "HookObserver",
+    "ClaudeCodeHookObserver",
+    "CodexHookObserver",
+    "OpenCodeHookObserver",
+    "create_observer",
+]
+
 
 @dataclass
 class HookEvent:
@@ -113,6 +122,7 @@ class HookObserver:
                     filtered_chars=event.filtered_chars,
                     session_id=event.session_id,
                     metadata=event.metadata,
+                    filter_active=bool(event.filtered_result),
                 )
             except OSError as e:
                 log.warning("Failed to write telemetry entry: %s", e)
@@ -237,7 +247,12 @@ class CodexHookObserver(HookObserver):
         """Observe a tool result from Codex execution.
 
         This is called by the shell wrapper after each tool execution.
+        Codex does not inject a session id, so when one is not supplied we fall
+        back to a per-hour key (codex-<YYYYMMDD-HH>) for reasonable grouping
+        rather than writing empty, unattributable session ids.
         """
+        if not session_id:
+            session_id = f"codex-{time.strftime('%Y%m%d-%H', time.gmtime())}"
         event = HookEvent(
             event_type="post_tool_use",
             tool_name=tool_name,
@@ -309,6 +324,4 @@ def create_observer(
         log.warning("Unknown platform '%s', falling back to generic HookObserver", platform)
         return HookObserver(bridge=bridge, telemetry_file=telemetry_file)
 
-    if platform == "codex":
-        return observer_cls(bridge=bridge, telemetry_file=telemetry_file)
     return observer_cls(bridge=bridge, telemetry_file=telemetry_file)

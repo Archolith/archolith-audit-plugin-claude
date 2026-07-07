@@ -3,8 +3,8 @@
 Provides a uniform interface for feeding tool result observations into the
 LiveAccumulator from multiple telemetry backends:
 
-  1. RTK FilterTelemetryStore — the primary in-session telemetry source
-     when archolith-rtk is installed and the filter pipeline is active.
+  1. archolith-filter FilterTelemetryStore — the primary in-session telemetry source
+     when archolith-filter is installed and the filter pipeline is active.
   2. File-based telemetry — reads accumulated observations from a JSONL
      file written by an external process (e.g., a hook observer).
   3. Direct push — programmatic injection of observations from a hook
@@ -17,7 +17,7 @@ Usage:
     from archolith_mcp_audit.telemetry_bridge import TelemetryBridge
 
     bridge = TelemetryBridge(accumulator=my_accumulator)
-    bridge.connect_rtk()          # connect to RTK telemetry store
+    bridge.connect_filter()       # connect to archolith-filter telemetry store
     bridge.connect_file(path)     # connect to file-based telemetry
     bridge.push(tool_name, raw, filtered)  # direct push
 """
@@ -34,6 +34,17 @@ from typing import Protocol
 from archolith_mcp_audit.accumulator import LiveAccumulator
 
 log = logging.getLogger(__name__)
+
+__all__ = [
+    "TelemetrySource",
+    "TelemetryEntry",
+    "FilterTelemetrySource",
+    "RtkTelemetrySource",  # backward compat alias
+    "FileTelemetrySource",
+    "InMemoryTelemetrySource",
+    "TelemetryBridge",
+    "write_telemetry_entry",
+]
 
 
 class TelemetrySource(Protocol):
@@ -60,11 +71,11 @@ class TelemetryEntry:
     metadata: dict = field(default_factory=dict)
 
 
-class RtkTelemetrySource:
-    """Telemetry source backed by archolith-rtk FilterTelemetryStore.
+class FilterTelemetrySource:
+    """Telemetry source backed by archolith-filter FilterTelemetryStore.
 
-    Reads from the RTK filter telemetry store when available.
-    Gracefully degrades when RTK is not installed.
+    Reads from the archolith-filter telemetry store when available.
+    Gracefully degrades when archolith-filter is not installed.
     """
 
     def __init__(self) -> None:
@@ -75,15 +86,19 @@ class RtkTelemetrySource:
 
     def _try_connect(self) -> None:
         try:
-            from archolith_rtk.telemetry import FilterTelemetryStore
-            self._store = FilterTelemetryStore()
+            # Use the module-level singleton accessor, NOT the FilterTelemetryStore
+            # constructor. The constructor returns a fresh, empty store; the
+            # proxy/filter pipeline records into the singleton, so reading a new
+            # instance would always report zero.
+            from archolith_filter.telemetry import get_filter_telemetry_store
+            self._store = get_filter_telemetry_store()
             self._available = True
-            log.info("Connected to RTK FilterTelemetryStore")
+            log.info("Connected to archolith-filter FilterTelemetryStore")
         except ImportError:
-            log.debug("archolith-rtk not installed, RTK telemetry unavailable")
+            log.debug("archolith-filter not installed, telemetry unavailable")
             self._available = False
         except Exception as e:
-            log.warning("Failed to connect to RTK FilterTelemetryStore: %s", e)
+            log.warning("Failed to connect to archolith-filter FilterTelemetryStore: %s", e)
             self._available = False
 
     def is_available(self) -> bool:
@@ -96,7 +111,12 @@ class RtkTelemetrySource:
         entries: list[TelemetryEntry] = []
 
         try:
-            records = getattr(self._store, "records", None)
+            # archolith-filter's FilterTelemetryStore exposes its records via the
+            # `entries` property. Prefer it; fall back to `records` / get_all()
+            # for other store shapes (kept for backward compatibility).
+            records = getattr(self._store, "entries", None)
+            if records is None:
+                records = getattr(self._store, "records", None)
             if records is None:
                 get_all = getattr(self._store, "get_all", None)
                 if get_all is not None:
@@ -119,7 +139,10 @@ class RtkTelemetrySource:
                 if tool_name is None:
                     tool_name = getattr(rec, "tool", "unknown")
                     if not warned_fallback["tool_name"]:
-                        log.warning("RTK record missing 'tool_name', falling back to 'tool': '%s'", tool_name)
+                        log.warning(
+                            "archolith-filter record missing 'tool_name', falling back to 'tool': '%s'",
+                            tool_name,
+                        )
                         warned_fallback["tool_name"] = True
 
                 raw_chars = getattr(rec, "raw_chars", None)
@@ -127,7 +150,7 @@ class RtkTelemetrySource:
                     raw_chars = getattr(rec, "raw_tokens", 0)
                     if not warned_fallback["raw_chars"]:
                         log.warning(
-                            "RTK record missing 'raw_chars', falling back to 'raw_tokens': %s",
+                            "archolith-filter record missing 'raw_chars', falling back to 'raw_tokens': %s",
                             raw_chars,
                         )
                         warned_fallback["raw_chars"] = True
@@ -137,7 +160,7 @@ class RtkTelemetrySource:
                     filtered_chars = getattr(rec, "filtered_tokens", 0)
                     if not warned_fallback["filtered_chars"]:
                         log.warning(
-                            "RTK record missing 'filtered_chars', falling back to 'filtered_tokens': %s",
+                            "archolith-filter record missing 'filtered_chars', falling back to 'filtered_tokens': %s",
                             filtered_chars,
                         )
                         warned_fallback["filtered_chars"] = True
@@ -151,9 +174,13 @@ class RtkTelemetrySource:
                     timestamp=timestamp,
                 ))
         except Exception as e:
-            log.warning("Error reading from RTK telemetry store: %s", e)
+            log.warning("Error reading from archolith-filter telemetry store: %s", e)
 
         return entries
+
+
+# Backward compatibility alias
+RtkTelemetrySource = FilterTelemetrySource
 
 
 class FileTelemetrySource:
@@ -280,7 +307,7 @@ class TelemetryBridge:
 
     Usage:
         bridge = TelemetryBridge(accumulator=acc)
-        bridge.connect_rtk()
+        bridge.connect_filter()
         bridge.connect_file(Path("/tmp/telemetry.jsonl"))
         bridge.add_source(InMemoryTelemetrySource())
 
@@ -293,12 +320,15 @@ class TelemetryBridge:
         self.sources: list[TelemetrySource] = []
         self._total_synced: int = 0
 
-    def connect_rtk(self) -> bool:
-        source = RtkTelemetrySource()
+    def connect_filter(self) -> bool:
+        source = FilterTelemetrySource()
         if source.is_available():
             self.sources.append(source)
             return True
         return False
+
+    # Backward compatibility alias
+    connect_rtk = connect_filter
 
     def connect_file(self, path: Path) -> bool:
         source = FileTelemetrySource(path)
@@ -368,16 +398,22 @@ def write_telemetry_entry(
     filtered_chars: int = 0,
     session_id: str = "",
     metadata: dict | None = None,
+    filter_active: bool = False,
 ) -> None:
     """Append a telemetry entry to a JSONL file.
 
     Utility for hook observers and external processes that want to
     write observations to a file that can be read by FileTelemetrySource.
+
+    ``filter_active`` records whether a real filter pass produced
+    ``filtered_chars``; when False, consumers should treat the row as raw-only
+    (no savings signal) rather than as a genuine 0% filter result.
     """
     entry = {
         "tool_name": tool_name,
         "raw_chars": raw_chars,
         "filtered_chars": filtered_chars,
+        "filter_active": filter_active,
         "timestamp": time.time(),
         "session_id": session_id,
     }
