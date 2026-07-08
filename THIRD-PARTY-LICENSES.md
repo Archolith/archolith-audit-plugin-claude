@@ -7,12 +7,11 @@ and keep their own licenses.
 |---------|------------------|------------------|
 | `tiktoken` | 0.12.0 | Installed package metadata reports `MIT License`. |
 | `fastmcp` | 3.2.4 | Installed package metadata reports `License-Expression: Apache-2.0`. |
-| `archolith-maintenance` | 0.1.0 | Local editable Archolith dependency; license policy should follow the Archolith suite release decision. |
 
 Verification command used:
 
 ```bash
-python -m pip show tiktoken fastmcp archolith-maintenance
+python -m pip show tiktoken fastmcp
 ```
 
 Before publishing public distributions, re-run the license check against the exact locked dependency
